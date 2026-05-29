@@ -18,6 +18,9 @@
 // ── WiFi credentials ───────────────────────────────────────────────────────
 const char* WIFI_SSID = "NatPark";
 const char* WIFI_PASS = "arches10553";
+const char* DJANGO_HOST = "192.168.1.136";
+const int DJANGO_PORT = 8000;
+const char* DJANGO_ENDPOINT = "/api/imu/";
 
 // ── Globals ────────────────────────────────────────────────────────────────
 volatile bool mems_event = false;
@@ -140,6 +143,39 @@ void setup() {
   Serial.print("Initial activity: "); Serial.println(activityLabel(currentActivity));
 }
 
+void postToDjango(const char* timestamp, int32_t ax, int32_t ay, int32_t az,
+                  int32_t gx, int32_t gy, int32_t gz, const char* activity) {
+  WiFiClient djangoClient;
+  if (!djangoClient.connect(DJANGO_HOST, DJANGO_PORT)) {
+    Serial.println("Django connection failed.");
+    return;
+  }
+
+  char body[256];
+  snprintf(body, sizeof(body),
+    "{\"timestamp\":\"%s\",\"ax_mg\":%ld,\"ay_mg\":%ld,\"az_mg\":%ld,"
+    "\"gx_dps\":%ld,\"gy_dps\":%ld,\"gz_dps\":%ld,\"activity\":\"%s\"}",
+    timestamp, ax, ay, az, gx, gy, gz, activity);
+
+  djangoClient.println("POST /api/imu/ HTTP/1.1");
+  djangoClient.print("Host: "); djangoClient.println(DJANGO_HOST);
+  djangoClient.println("Content-Type: application/json");
+  djangoClient.print("Content-Length: "); djangoClient.println(strlen(body));
+  djangoClient.println("Connection: close");
+  djangoClient.println();
+  djangoClient.println(body);
+
+  unsigned long timeout = millis() + 3000;
+  while (!djangoClient.available() && millis() < timeout);
+  String response = djangoClient.readStringUntil('\n');
+  if (response.indexOf("201") >= 0) {
+    Serial.println("Posted to Django OK.");
+  } else {
+    Serial.print("Django response: "); Serial.println(response);
+  }
+  djangoClient.stop();
+}
+
 // ── Loop ───────────────────────────────────────────────────────────────────
 void loop() {
   if (mems_event) {
@@ -178,7 +214,7 @@ void loop() {
     activityLabel(currentActivity));
   strncat(rowBuf, row, sizeof(rowBuf) - strlen(rowBuf) - 1);
 
-  // Serial Monitor once per second
+  // Serial Monitor + post to Django once per second
   if (now - lastSerialPrint >= 1000) {
     lastSerialPrint = now;
     Serial.print("Time: "); Serial.print(timestamp);
@@ -189,9 +225,11 @@ void loop() {
     Serial.print(" gy:"); Serial.print(gyro[1]);
     Serial.print(" gz:"); Serial.print(gyro[2]);
     Serial.print(" | "); Serial.println(activityLabel(currentActivity));
+    postToDjango(timestamp, accel[0], accel[1], accel[2],
+                 gyro[0], gyro[1], gyro[2], activityLabel(currentActivity));
   }
 
-  // Flush every 2 seconds
+  // Flush to flash every 2 seconds
   static unsigned long lastFlush = 0;
   if (now - lastFlush > 2000) {
     lastFlush = now;
