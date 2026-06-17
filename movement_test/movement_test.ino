@@ -2,8 +2,6 @@
 #include "lsm6dsox_activity_recognition_for_mobile.h"
 #include <LittleFS_Mbed_RP2040.h>
 #include <WiFiNINA.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
 #define SerialPort Serial
 
 // ── Pin / bus ──────────────────────────────────────────────────────────────
@@ -16,9 +14,9 @@
 #endif
 
 // ── WiFi credentials ───────────────────────────────────────────────────────
-const char* WIFI_SSID = "NatPark";
-const char* WIFI_PASS = "arches10553";
-const char* DJANGO_HOST = "192.168.1.136";
+const char* WIFI_SSID = "TP-Link_CEF4";
+const char* WIFI_PASS = "23753112";
+const char* DJANGO_HOST = "192.168.0.101";
 const int DJANGO_PORT = 8000;
 const char* DJANGO_ENDPOINT = "/api/imu/";
 
@@ -27,8 +25,6 @@ volatile bool mems_event = false;
 LSM6DSOXSensor AccGyr(&DEV_I2C, LSM6DSOX_I2C_ADD_L);
 WiFiServer server(80);
 LittleFS_MBED lfs;
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", -25200);
 
 const char* LOG_FILE = MBED_LITTLEFS_FILE_PREFIX "/imu_log.csv";
 uint8_t currentActivity = 255;
@@ -125,12 +121,23 @@ void setup() {
   server.begin();
   Serial.println("HTTP server started.");
 
-  timeClient.begin();
-  timeClient.update();
-  sessionStartEpoch = timeClient.getEpochTime();
+  WiFiClient timeHttpClient;
+  if (timeHttpClient.connect(DJANGO_HOST, DJANGO_PORT)) {
+    timeHttpClient.println("GET /api/time/ HTTP/1.1");
+    timeHttpClient.print("Host: "); timeHttpClient.println(DJANGO_HOST);
+    timeHttpClient.println("Connection: close");
+    timeHttpClient.println();
+    delay(500);
+    String response = timeHttpClient.readString();
+    int idx = response.indexOf("\"epoch\":");
+    if (idx >= 0) {
+        sessionStartEpoch = response.substring(idx + 8).toInt();
+        Serial.print("Time from Pi: "); Serial.println(sessionStartEpoch);
+    }
+    timeHttpClient.stop();
+  }
   sessionStartMillis = millis();
-  Serial.print("Time synced: "); Serial.println(timeClient.getFormattedTime());
-
+  
   pinMode(INT_1, INPUT);
   attachInterrupt(INT_1, INT1Event_cb, RISING);
 
@@ -196,8 +203,7 @@ void loop() {
   AccGyr.Get_G_Axes(gyro);
 
   unsigned long now = millis();
-  unsigned long epochTime = sessionStartEpoch + (now - sessionStartMillis) / 1000;
-
+  unsigned long epochTime = sessionStartEpoch + (now - sessionStartMillis) / 1000 - 25200;
   // Format timestamp
   int yr, mo, dy, hr, mn, sc;
   epochToDateTime(epochTime, yr, mo, dy, hr, mn, sc);
