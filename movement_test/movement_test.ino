@@ -2,6 +2,11 @@
 #include "lsm6dsox_activity_recognition_for_mobile.h"
 #include <LittleFS_Mbed_RP2040.h>
 #include <WiFiNINA.h>
+#include <Chirale_TensorFlowLite.h>
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "model.h"
 #define SerialPort Serial
 
 // ── Pin / bus ──────────────────────────────────────────────────────────────
@@ -32,6 +37,15 @@ bool logging = false;
 unsigned long sessionStartMillis = 0;
 unsigned long sessionStartEpoch = 0;
 unsigned long lastSerialPrint = 0;
+
+// ── TFLite globals ─────────────────────────────────────────────────────────
+const tflite::Model* tfl_model = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* tfl_input = nullptr;
+TfLiteTensor* tfl_output = nullptr;
+constexpr int kTensorArenaSize = 16 * 1024;
+alignas(16) uint8_t tensor_arena[kTensorArenaSize];
+float lastPrediction = -1.0f;
 
 // ── Forward declarations ───────────────────────────────────────────────────
 void INT1Event_cb();
@@ -137,7 +151,27 @@ void setup() {
     timeHttpClient.stop();
   }
   sessionStartMillis = millis();
-  
+
+  // ── TFLite setup ──────────────────────────────────────────────────────
+  tfl_model = tflite::GetModel(model_tflite);
+  if (tfl_model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.println("Model schema mismatch!");
+    while (1);
+  }
+
+  static tflite::AllOpsResolver resolver;
+  static tflite::MicroInterpreter static_interpreter(
+    tfl_model, resolver, tensor_arena, kTensorArenaSize);
+  interpreter = &static_interpreter;
+
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("AllocateTensors failed!");
+    while (1);
+  }
+  tfl_input = interpreter->input(0);
+  tfl_output = interpreter->output(0);
+  Serial.println("TFLite model loaded.");
+
   pinMode(INT_1, INPUT);
   attachInterrupt(INT_1, INT1Event_cb, RISING);
 
@@ -198,57 +232,123 @@ void loop() {
     }
   }
 
-  int32_t accel[3], gyro[3];
-  AccGyr.Get_X_Axes(accel);
-  AccGyr.Get_G_Axes(gyro);
+  static int32_t batchAccel[10][3];
+  static int32_t batchGyro[10][3];
+  static char batchTimestamps[10][20];
+  static int batchCount = 0;
+  static unsigned long lastBatchSend = 0;
+  static unsigned long lastSample = 0;
 
   unsigned long now = millis();
-  unsigned long epochTime = sessionStartEpoch + (now - sessionStartMillis) / 1000 - 25200;
-  // Format timestamp
-  int yr, mo, dy, hr, mn, sc;
-  epochToDateTime(epochTime, yr, mo, dy, hr, mn, sc);
-  char timestamp[20];
-  snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d", yr, mo, dy, hr, mn, sc);
 
-  // Buffer row
-  static char rowBuf[4096] = "";
-  char row[128];
-  snprintf(row, sizeof(row), "%s,%ld,%ld,%ld,%ld,%ld,%ld,%s\n",
-    timestamp,
-    accel[0], accel[1], accel[2],
-    gyro[0],  gyro[1],  gyro[2],
-    activityLabel(currentActivity));
-  strncat(rowBuf, row, sizeof(rowBuf) - strlen(rowBuf) - 1);
+  // Sample at 10Hz (every 100ms)
+  if (now - lastSample >= 100) {
+    lastSample = now;
 
-  // Serial Monitor + post to Django once per second
-  if (now - lastSerialPrint >= 1000) {
-    lastSerialPrint = now;
-    Serial.print("Time: "); Serial.print(timestamp);
-    Serial.print(" | ax:"); Serial.print(accel[0]);
+    int32_t accel[3], gyro[3];
+    AccGyr.Get_X_Axes(accel);
+    AccGyr.Get_G_Axes(gyro);
+
+    unsigned long epochTime = sessionStartEpoch + (now - sessionStartMillis) / 1000 - 25200;
+    int yr, mo, dy, hr, mn, sc;
+    epochToDateTime(epochTime, yr, mo, dy, hr, mn, sc);
+    snprintf(batchTimestamps[batchCount], sizeof(batchTimestamps[0]),
+      "%04d-%02d-%02d %02d:%02d:%02d", yr, mo, dy, hr, mn, sc);
+
+    batchAccel[batchCount][0] = accel[0];
+    batchAccel[batchCount][1] = accel[1];
+    batchAccel[batchCount][2] = accel[2];
+    batchGyro[batchCount][0] = gyro[0];
+    batchGyro[batchCount][1] = gyro[1];
+    batchGyro[batchCount][2] = gyro[2];
+
+    // Run inference on latest reading
+    float ax_n = max(0.0f, min(1.0f, ((float)accel[0] - (-1138.0f)) / (794.0f - (-1138.0f))));
+    float ay_n = max(0.0f, min(1.0f, ((float)accel[1] - (-511.0f)) / (713.0f - (-511.0f))));
+    float az_n = max(0.0f, min(1.0f, ((float)accel[2] - (-169.0f)) / (1921.0f - (-169.0f))));
+    float gx_n = max(0.0f, min(1.0f, ((float)gyro[0] - (-47425.0f)) / (97448.0f - (-47425.0f))));
+    float gy_n = max(0.0f, min(1.0f, ((float)gyro[1] - (-252157.0f)) / (210113.0f - (-252157.0f))));
+    float gz_n = max(0.0f, min(1.0f, ((float)gyro[2] - (-69825.0f)) / (139615.0f - (-69825.0f))));
+
+    tfl_input->data.f[0] = ax_n;
+    tfl_input->data.f[1] = ay_n;
+    tfl_input->data.f[2] = az_n;
+    tfl_input->data.f[3] = gx_n;
+    tfl_input->data.f[4] = gy_n;
+    tfl_input->data.f[5] = gz_n;
+
+    if (interpreter->Invoke() == kTfLiteOk) {
+      lastPrediction = tfl_output->data.f[0];
+      digitalWrite(LED_BUILTIN, lastPrediction <= 0.5 ? HIGH : LOW);
+    }
+
+    Serial.print("ax:"); Serial.print(accel[0]);
     Serial.print(" ay:"); Serial.print(accel[1]);
     Serial.print(" az:"); Serial.print(accel[2]);
     Serial.print(" | gx:"); Serial.print(gyro[0]);
     Serial.print(" gy:"); Serial.print(gyro[1]);
     Serial.print(" gz:"); Serial.print(gyro[2]);
-    Serial.print(" | "); Serial.println(activityLabel(currentActivity));
-    postToDjango(timestamp, accel[0], accel[1], accel[2],
-                 gyro[0], gyro[1], gyro[2], activityLabel(currentActivity));
+    Serial.print(" | "); Serial.print(activityLabel(currentActivity));
+    Serial.print(" | Pred: "); Serial.print(lastPrediction);
+    Serial.println(lastPrediction > 0.5 ? " (Cruising)" : " (Not cruising)");
+
+    batchCount++;
+  }
+
+  // Send batch every second
+  if (now - lastBatchSend >= 1000 && batchCount > 0) {
+    lastBatchSend = now;
+    int countToSend = batchCount;
+    batchCount = 0;
+
+    String body = "[";
+    for (int i = 0; i < countToSend; i++) {
+      if (i > 0) body += ",";
+      body += "{\"timestamp\":\"";
+      body += batchTimestamps[i];
+      body += "\",\"ax_mg\":";
+      body += batchAccel[i][0];
+      body += ",\"ay_mg\":";
+      body += batchAccel[i][1];
+      body += ",\"az_mg\":";
+      body += batchAccel[i][2];
+      body += ",\"gx_dps\":";
+      body += batchGyro[i][0];
+      body += ",\"gy_dps\":";
+      body += batchGyro[i][1];
+      body += ",\"gz_dps\":";
+      body += batchGyro[i][2];
+      body += ",\"activity\":\"";
+      body += activityLabel(currentActivity);
+      body += "\"}";
+    }
+    body += "]";
+
+    WiFiClient djangoClient;
+    djangoClient.setTimeout(200);
+    if (djangoClient.connect(DJANGO_HOST, DJANGO_PORT)) {
+      djangoClient.println("POST /api/imu/batch/ HTTP/1.1");
+      djangoClient.print("Host: "); djangoClient.println(DJANGO_HOST);
+      djangoClient.println("Content-Type: application/json");
+      djangoClient.print("Content-Length: "); djangoClient.println(body.length());
+      djangoClient.println("Connection: close");
+      djangoClient.println();
+      djangoClient.print(body);
+      djangoClient.stop();
+      Serial.print("Batch sent (");
+      Serial.print(countToSend);
+      Serial.println(" records)");
+    } else {
+      Serial.println("Django connection failed - skipping batch.");
+    }
   }
 
   // Flush to flash every 2 seconds
   static unsigned long lastFlush = 0;
   if (now - lastFlush > 2000) {
     lastFlush = now;
-    FILE* f = fopen(LOG_FILE, "a");
-    if (f) {
-      fprintf(f, "%s", rowBuf);
-      fclose(f);
-    }
-    rowBuf[0] = '\0';
     handleHTTP();
   }
-
-  delay(38);
 }
 
 // ── HTTP handler ───────────────────────────────────────────────────────────
@@ -293,6 +393,7 @@ void handleHTTP() {
     client.println("<!DOCTYPE html><html><body>");
     client.println("<h2>LSM6DSOX IMU Logger</h2>");
     client.print("<p>Current activity: <b>"); client.print(activityLabel(currentActivity)); client.println("</b></p>");
+    client.print("<p>Last prediction: <b>"); client.print(lastPrediction > 0.5 ? "Cruising" : "Not cruising"); client.println("</b></p>");
     client.println("<a href='/download'><button>Download CSV</button></a>");
     client.println("</body></html>");
     client.stop();
